@@ -710,6 +710,88 @@ function patchMongoExports(mongodb: Record<string, unknown>): boolean {
   return true;
 }
 
+/**
+ * Real connection details for a redis client, across both supported drivers.
+ *
+ * ioredis exposes them flat on `options`; node-redis v4 nests the address under
+ * `options.socket` and calls the database `database`. The patch used to hardcode
+ * host 'unknown' / port 6379 / db '0', which made every redis span claim a
+ * connection it had never checked — and left no way to tell n8n's queue Redis
+ * apart from a Redis the agent actually uses.
+ */
+export function redisConnectionInfo(client: unknown): {
+  host: string | null;
+  port: number | null;
+  db: string | null;
+} {
+  const opts = (client as {
+    options?: {
+      host?: string;
+      port?: number;
+      db?: number;
+      database?: number;
+      socket?: { host?: string; port?: number };
+    };
+  } | null)?.options ?? {};
+  const host = opts.host ?? opts.socket?.host ?? null;
+  const port = opts.port ?? opts.socket?.port ?? null;
+  const db = opts.db ?? opts.database;
+  return {
+    host: host ? String(host) : null,
+    port: port != null && Number.isFinite(Number(port)) ? Number(port) : null,
+    db: db != null ? String(db) : null,
+  };
+}
+
+/**
+ * True when this connection is n8n's own Bull queue Redis.
+ *
+ * In queue mode n8n runs a main + worker pair coordinated through Redis. Because
+ * the sendCommand patch sits on the driver prototype and AsyncLocalStorage
+ * propagates down the whole call stack, every queue heartbeat, job poll and
+ * pub/sub message n8n makes *while an activity is open* inherits our activity
+ * scope and used to be reported as an agent span. A hosted trace for a workflow
+ * whose only memory was Postgres came back with five of seven spans being
+ * redis — none of them the agent's work.
+ *
+ * Matches host AND port, mirroring isN8nInternalPgConnection's AND semantics so
+ * a different Redis on the same host is still traced.
+ */
+export function isN8nQueueRedisConnection(
+  host: string | null | undefined,
+  port: number | null | undefined,
+): boolean {
+  if ((_env.EXECUTIONS_MODE || '').toLowerCase() !== 'queue') return false;
+  const queueHost = (_env.QUEUE_BULL_REDIS_HOST || 'localhost').toLowerCase();
+  const queuePort = Number(_env.QUEUE_BULL_REDIS_PORT || 6379);
+  return (
+    Boolean(host) && host!.toLowerCase() === queueHost &&
+    port != null && Number(port) === queuePort
+  );
+}
+
+/**
+ * True when the command itself targets n8n-internal keys or channels.
+ *
+ * Backstop for the connection check above: when the queue Redis and a Redis the
+ * agent uses are the same instance, host/port cannot separate them, but the keys
+ * still can. Bull namespaces everything under its prefix (default 'bull'), and
+ * n8n's own pub/sub channels are 'n8n.*'. Every token is checked rather than
+ * just the first key, because Bull drives most of its work through EVALSHA,
+ * where the keys sit several arguments in.
+ */
+export function isN8nInternalRedisCommand(statement: string): boolean {
+  const prefix = (_env.QUEUE_BULL_PREFIX || 'bull').toLowerCase();
+  return statement
+    .toLowerCase()
+    .split(/\s+/)
+    .some((token) => (
+      token.startsWith(`${prefix}:`) ||
+      token.startsWith('n8n.') ||
+      token.startsWith('n8n:')
+    ));
+}
+
 function patchRedis(): boolean {
   try {
     const _redisMod = 'redis';
@@ -760,19 +842,33 @@ function patchRedisClient(client: Record<string, unknown>): boolean {
       : String((command as Record<string, unknown> | null)?.name ?? command ?? 'UNKNOWN');
     const statement = Array.isArray(command) ? command.map(String).join(' ') : name;
     const operation = name.toUpperCase();
+
+    // n8n's own queue traffic is not the agent's work — see
+    // isN8nQueueRedisConnection / isN8nInternalRedisCommand.
+    const conn = redisConnectionInfo(this);
+    if (
+      isN8nQueueRedisConnection(conn.host, conn.port) ||
+      isN8nInternalRedisCommand(statement)
+    ) {
+      return original.call(this, command, ...args);
+    }
+
+    const dbOpts = {
+      dbSystem: 'redis' as const,
+      dbName: conn.db,
+      operation,
+      statement,
+      host: conn.host,
+      port: conn.port,
+    };
     const startMs = Date.now();
-    void evaluateDb(activityId, { dbSystem: 'redis', dbName: '0', operation, statement, host: 'unknown', port: 6379, stage: 'started', startMs });
+    void evaluateDb(activityId, { ...dbOpts, stage: 'started', startMs });
     const result = original.call(this, command, ...args) as unknown;
     if (result && typeof result === 'object' && typeof (result as { then?: unknown }).then === 'function') {
       return (result as Promise<unknown>).then(
         async (value) => {
           await evaluateDb(activityId, {
-            dbSystem: 'redis',
-            dbName: '0',
-            operation,
-            statement,
-            host: 'unknown',
-            port: 6379,
+            ...dbOpts,
             stage: 'completed',
             startMs,
             endMs: Date.now(),
@@ -781,12 +877,7 @@ function patchRedisClient(client: Record<string, unknown>): boolean {
         },
         async (err) => {
           await evaluateDb(activityId, {
-            dbSystem: 'redis',
-            dbName: '0',
-            operation,
-            statement,
-            host: 'unknown',
-            port: 6379,
+            ...dbOpts,
             stage: 'completed',
             startMs,
             endMs: Date.now(),
