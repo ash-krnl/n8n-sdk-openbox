@@ -1,5 +1,10 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.buildDbSpanData = buildDbSpanData;
+exports.isN8nOrmStack = isN8nOrmStack;
+exports.redisConnectionInfo = redisConnectionInfo;
+exports.isN8nQueueRedisConnection = isN8nQueueRedisConnection;
+exports.isN8nInternalRedisCommand = isN8nInternalRedisCommand;
 exports.setupNodeHookInstrumentation = setupNodeHookInstrumentation;
 // Access process.env via require() indirection to avoid the no-restricted-globals
 // ESLint rule that flags the bare `process` identifier.
@@ -77,7 +82,7 @@ async function evaluateFile(activityId, opts) {
     await (0, span_processor_1.evaluateActivitySpan)(activityId, buildFileSpanData(activityId, opts));
 }
 function buildDbSpanData(activityId, opts) {
-    const operation = classifySql(opts.statement);
+    const operation = opts.operation ?? classifySql(opts.statement);
     return {
         ...spanBase(`${operation} ${opts.dbSystem}`, 'CLIENT', opts.stage, opts.startMs, opts.error, opts.endMs, `${activityId}|db|${opts.dbSystem}|${opts.statement}|${opts.startMs}`),
         hook_type: 'db_query',
@@ -346,21 +351,47 @@ function patchPg() {
     return patched;
 }
 /**
- * Returns true when the given pg connection parameters identify n8n's own
- * internal database (workflows, credentials, executions). Queries on that
- * connection are n8n bookkeeping — capturing them as governance spans would
- * add noise for every tool invocation that causes n8n to refresh credentials.
+ * Frames belonging to n8n's own persistence layer.
  *
- * Detection: both host AND database must match the DB_POSTGRESDB_* env vars
- * (defaults: host=postgres, database=n8n). Using AND avoids false positives
- * when the user's application database lives on the same host but has a
- * different name, or vice-versa.
+ * n8n routes every internal database access through its TypeORM fork, and the
+ * agent's work never goes through it — a traced run separates 17/17 correctly
+ * on this signal: n8n's credential lookups and TypeORM's own `SET search_path`
+ * / `SET statement_timeout` on one side, the agent's chat-memory queries on the
+ * other.
+ *
+ * Deliberately matches the `@n8n/typeorm` fork rather than any TypeORM: a tool
+ * querying its own database through vanilla TypeORM is the agent's work and
+ * must still be traced.
  */
-function isN8nInternalPgConnection(host, dbName) {
-    const n8nHost = (_env.DB_POSTGRESDB_HOST || 'postgres').toLowerCase();
-    const n8nDb = (_env.DB_POSTGRESDB_DATABASE || 'n8n').toLowerCase();
-    return (Boolean(host) && host.toLowerCase() === n8nHost &&
-        Boolean(dbName) && dbName.toLowerCase() === n8nDb);
+const N8N_ORM_FRAME = /[\\/]@n8n[\\/]typeorm[\\/]/;
+/** True when this stack shows the query came from n8n's own ORM. */
+function isN8nOrmStack(stack) {
+    return N8N_ORM_FRAME.test(stack);
+}
+/**
+ * True when the caller is n8n's own persistence layer rather than the agent.
+ *
+ * Replaces an earlier check that compared the *connection* against the
+ * DB_POSTGRESDB_* env vars. That could not work when the agent and n8n share a
+ * database — n8n's own compose setup points a Postgres chat memory at exactly
+ * that database — and it silently dropped every memory span: a run whose agent
+ * issued 5 memory queries reported none of them. Call origin is independent of
+ * host, database and table naming, so it holds however the deployment is wired.
+ *
+ * Costs one stack capture per query, and only inside a governed activity: the
+ * caller checks `getCurrentActivityId()` before reaching here.
+ *
+ * If an async boundary ever drops the ORM frame, an n8n query surfaces as one
+ * stray span — visible and fixable. It cannot silently swallow agent data,
+ * which is the failure the connection check produced.
+ */
+function isN8nOrmQuery() {
+    const previousLimit = Error.stackTraceLimit;
+    // The ORM frame sits a few frames up, past pg's own internals.
+    Error.stackTraceLimit = 40;
+    const stack = new Error().stack ?? '';
+    Error.stackTraceLimit = previousLimit;
+    return isN8nOrmStack(stack);
 }
 function patchPgExports(pg) {
     try {
@@ -392,9 +423,9 @@ function patchPgExports(pg) {
                 const host = self.host ?? self.options?.host ?? self.connectionParameters?.host;
                 const port = self.port ?? self.options?.port ?? self.connectionParameters?.port;
                 const dbName = self.database ?? self.options?.database ?? self.connectionParameters?.database;
-                // Skip n8n's own internal postgres (credentials/workflows DB) to avoid
-                // spurious spans from n8n loading credentials during tool execution.
-                if (isN8nInternalPgConnection(host, dbName))
+                // n8n's own bookkeeping (credential lookups during node init) is not
+                // the agent's work; the agent's queries on the same database are.
+                if (isN8nOrmQuery())
                     return original.call(self, query, ...args);
                 const dbOpts = {
                     dbSystem: 'postgresql',
@@ -581,13 +612,15 @@ function patchMongoExports(mongodb) {
             const statement = JSON.stringify({ [method]: filter ?? {} }).slice(0, 2000);
             const startMs = Date.now();
             const dbName = self.dbName ?? self.s?.dbName ?? String(self.namespace ?? self.s?.namespace ?? '').split('.')[0];
-            void evaluateDb(activityId, { dbSystem: 'mongodb', dbName, statement, host: 'unknown', port: null, stage: 'started', startMs });
+            const operation = method.toUpperCase();
+            void evaluateDb(activityId, { dbSystem: 'mongodb', dbName, operation, statement, host: 'unknown', port: null, stage: 'started', startMs });
             const result = original.call(self, filter, ...args);
             if (result && typeof result === 'object' && typeof result.then === 'function') {
                 return result.then(async (value) => {
                     await evaluateDb(activityId, {
                         dbSystem: 'mongodb',
                         dbName,
+                        operation,
                         statement,
                         host: 'unknown',
                         port: null,
@@ -600,6 +633,7 @@ function patchMongoExports(mongodb) {
                     await evaluateDb(activityId, {
                         dbSystem: 'mongodb',
                         dbName,
+                        operation,
                         statement,
                         host: 'unknown',
                         port: null,
@@ -615,6 +649,67 @@ function patchMongoExports(mongodb) {
         };
     }
     return true;
+}
+/**
+ * Real connection details for a redis client, across both supported drivers.
+ *
+ * ioredis exposes them flat on `options`; node-redis v4 nests the address under
+ * `options.socket` and calls the database `database`. The patch used to hardcode
+ * host 'unknown' / port 6379 / db '0', which made every redis span claim a
+ * connection it had never checked — and left no way to tell n8n's queue Redis
+ * apart from a Redis the agent actually uses.
+ */
+function redisConnectionInfo(client) {
+    const opts = client?.options ?? {};
+    const host = opts.host ?? opts.socket?.host ?? null;
+    const port = opts.port ?? opts.socket?.port ?? null;
+    const db = opts.db ?? opts.database;
+    return {
+        host: host ? String(host) : null,
+        port: port != null && Number.isFinite(Number(port)) ? Number(port) : null,
+        db: db != null ? String(db) : null,
+    };
+}
+/**
+ * True when this connection is n8n's own Bull queue Redis.
+ *
+ * In queue mode n8n runs a main + worker pair coordinated through Redis. Because
+ * the sendCommand patch sits on the driver prototype and AsyncLocalStorage
+ * propagates down the whole call stack, every queue heartbeat, job poll and
+ * pub/sub message n8n makes *while an activity is open* inherits our activity
+ * scope and used to be reported as an agent span. A hosted trace for a workflow
+ * whose only memory was Postgres came back with five of seven spans being
+ * redis — none of them the agent's work.
+ *
+ * Matches host AND port, mirroring the pg filter's AND semantics so
+ * a different Redis on the same host is still traced.
+ */
+function isN8nQueueRedisConnection(host, port) {
+    if ((_env.EXECUTIONS_MODE || '').toLowerCase() !== 'queue')
+        return false;
+    const queueHost = (_env.QUEUE_BULL_REDIS_HOST || 'localhost').toLowerCase();
+    const queuePort = Number(_env.QUEUE_BULL_REDIS_PORT || 6379);
+    return (Boolean(host) && host.toLowerCase() === queueHost &&
+        port != null && Number(port) === queuePort);
+}
+/**
+ * True when the command itself targets n8n-internal keys or channels.
+ *
+ * Backstop for the connection check above: when the queue Redis and a Redis the
+ * agent uses are the same instance, host/port cannot separate them, but the keys
+ * still can. Bull namespaces everything under its prefix (default 'bull'), and
+ * n8n's own pub/sub channels are 'n8n.*'. Every token is checked rather than
+ * just the first key, because Bull drives most of its work through EVALSHA,
+ * where the keys sit several arguments in.
+ */
+function isN8nInternalRedisCommand(statement) {
+    const prefix = (_env.QUEUE_BULL_PREFIX || 'bull').toLowerCase();
+    return statement
+        .toLowerCase()
+        .split(/\s+/)
+        .some((token) => (token.startsWith(`${prefix}:`) ||
+        token.startsWith('n8n.') ||
+        token.startsWith('n8n:')));
 }
 function patchRedis() {
     try {
@@ -667,17 +762,29 @@ function patchRedisClient(client) {
             ? String(command[0] ?? 'UNKNOWN')
             : String(command?.name ?? command ?? 'UNKNOWN');
         const statement = Array.isArray(command) ? command.map(String).join(' ') : name;
+        const operation = name.toUpperCase();
+        // n8n's own queue traffic is not the agent's work — see
+        // isN8nQueueRedisConnection / isN8nInternalRedisCommand.
+        const conn = redisConnectionInfo(this);
+        if (isN8nQueueRedisConnection(conn.host, conn.port) ||
+            isN8nInternalRedisCommand(statement)) {
+            return original.call(this, command, ...args);
+        }
+        const dbOpts = {
+            dbSystem: 'redis',
+            dbName: conn.db,
+            operation,
+            statement,
+            host: conn.host,
+            port: conn.port,
+        };
         const startMs = Date.now();
-        void evaluateDb(activityId, { dbSystem: 'redis', dbName: '0', statement, host: 'unknown', port: 6379, stage: 'started', startMs });
+        void evaluateDb(activityId, { ...dbOpts, stage: 'started', startMs });
         const result = original.call(this, command, ...args);
         if (result && typeof result === 'object' && typeof result.then === 'function') {
             return result.then(async (value) => {
                 await evaluateDb(activityId, {
-                    dbSystem: 'redis',
-                    dbName: '0',
-                    statement,
-                    host: 'unknown',
-                    port: 6379,
+                    ...dbOpts,
                     stage: 'completed',
                     startMs,
                     endMs: Date.now(),
@@ -685,11 +792,7 @@ function patchRedisClient(client) {
                 return value;
             }, async (err) => {
                 await evaluateDb(activityId, {
-                    dbSystem: 'redis',
-                    dbName: '0',
-                    statement,
-                    host: 'unknown',
-                    port: 6379,
+                    ...dbOpts,
                     stage: 'completed',
                     startMs,
                     endMs: Date.now(),

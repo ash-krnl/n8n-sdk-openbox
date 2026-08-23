@@ -1,5 +1,21 @@
 # OpenBox + n8n integration example
 
+## Agent Builder: describe an agent, get one governed and running
+
+[`agent-builder/`](agent-builder/) is a chat UI on top of this stack: describe
+an agent in a few messages and it provisions a real OpenBox agent (guardrails
++ governance policy) and an active n8n workflow using the `OpenBox: Agent`
+node below, then hands you one screen to chat with it and manage its
+governance. See [`agent-builder/README.md`](agent-builder/README.md).
+
+```bash
+cp .env.example .env   # fill in N8N_API_KEY, OPENBOX_BACKEND_API_KEY, etc. — see agent-builder/README.md
+docker compose up --build
+# open http://localhost:3100
+```
+
+---
+
 A self-contained n8n demo for OpenBox-governed support triage. The hosted
 POC runs at `https://app.ipsum.lat/ob/n8n/` and uses built-in n8n nodes for
 Slack, Postgres logging, optional HubSpot, and hosted chat, plus one custom
@@ -273,23 +289,35 @@ schema in `demo`.
 
 ```text
 example/n8n/
-  README.md
+  README.md                     this file
+  QUICKSTART.md                 fastest path to a running demo
+  PRODUCTION.md                 hardening notes for real deployments
+  RELEASING.md                  release process for the community node
   docker-compose.yml
-  docker-compose.ipsum.yml
-  docker-compose.ipsum-host-caddy.yml
   .env.example
-  .env.ipsum.example
-  hosting/Caddyfile
-  slack-app-manifest.json
-  slack-app-manifest.yml
-  workflows/sdk-showcase.json
-  custom-node/
+  start.ps1 / start.bat         Windows launchers
+  agent-builder/                describe an agent, get one governed and running
+  workflows/                    importable n8n workflow JSON
+  credentials/                  importable n8n credential JSON
+  seed/                         database seed for the demo
+  demo-data/                    sample inputs for the demo flows
+  custom-node/                  the n8n-nodes-openbox-hook package
     Dockerfile
+    entrypoint.sh
     package.json
     tsconfig.json
-    entrypoint.sh
-    src/OpenboxLlm.node.ts
-    assets/OB_logomark.png
+    nodes/OpenBoxAgent/         the OpenBox: Agent node
+    credentials/                the OpenBox API credential
+    shared/                     signing, Core client, governance middleware
+    tests/                      vitest suites
+    scripts/                    build helpers
+    assets/logomark.svg
+  openbox-langchain-sdk-ts/     reference SDK ports
+  openbox-mastra-sdk/
+  openbox-temporal-sdk-python/
 ```
+
+See [custom-node/README.md](./custom-node/README.md) for the node's own
+parameters, credential fields, and package layout.
 
 No build artifacts (`dist/`, `node_modules/`) should be checked in.
