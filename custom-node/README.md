@@ -96,17 +96,112 @@ are chosen so the node is useful without configuration.
 ### Spans
 
 With instrumentation enabled, each governed activity carries spans for the work
-it performed — HTTP requests, database queries, and file operations — as a
-`started` / `completed` pair sharing one span id, so the dashboard can show real
-durations. Spans are only recorded for work that runs inside a governed
-activity's async context; unrelated I/O elsewhere in the n8n process is not
-captured.
+it performed, as a `started` / `completed` pair sharing one span id so the
+dashboard can show a real duration.
+
+Spans are only recorded for work that runs **inside a governed activity's async
+context**. I/O elsewhere in the n8n process — background jobs, queue polling,
+n8n's own persistence between executions — is not captured, by design.
+
+| Kind | Span name | Notes |
+|---|---|---|
+| HTTP | `POST https://…` (plus the status code on the completed half) | On by default. Covers the LLM provider call and any HTTP-backed tool. |
+| PostgreSQL | `SELECT postgresql`, `INSERT postgresql`, … | On by default. Excludes n8n's own queries — see below. |
+| MySQL | `SELECT mysql`, … | On by default. |
+| MongoDB | `FIND mongodb`, `INSERTONE mongodb`, … | On by default. Named by collection method. |
+| Redis | `GET redis`, `HGETALL redis`, … | On by default. Excludes n8n's queue traffic — see below. |
+| File I/O | `file.read`, `file.write`, … | **Off** by default. |
+
+#### Telling your work apart from n8n's
+
+The node runs inside n8n, so it sees n8n's own database and Redis traffic as
+well as the agent's. Two filters separate them:
+
+- **Postgres** — a query is skipped when its call stack shows it came from
+  n8n's own ORM (`@n8n/typeorm`). This is deliberately independent of host,
+  database and table name, because a self-hosted n8n and an agent's memory very
+  often share one database — n8n's own compose setup does exactly that. Vanilla
+  TypeORM is *not* excluded: a tool querying its own database through TypeORM is
+  the agent's work and is traced.
+- **Redis** — a command is skipped when the connection is n8n's Bull queue
+  (matching `QUEUE_BULL_REDIS_HOST` and `QUEUE_BULL_REDIS_PORT`, in queue mode)
+  or when the command touches n8n's own keys (`bull:*`, `n8n.*`, honouring
+  `QUEUE_BULL_PREFIX`).
+
+Both fail toward *showing too much* rather than too little: an unrecognised
+internal query appears as one stray span you can see and report, instead of
+silently discarding a span you needed.
 
 ### Advanced: Agent DID signing
 
 For agents configured with `signing_required = true` in OpenBox, fill in the
 **Agent DID** and **Agent Private Key** fields in the credential. Every request
 to the OpenBox API will be signed with an Ed25519 signature automatically.
+
+## Limitations and known issues
+
+Worth reading before you rely on a trace.
+
+### Governance adds latency
+
+Every event and every span is a round trip to the OpenBox API, and sends are
+serialised per activity so ordering is preserved. A run with many database spans
+makes proportionally many calls. If that matters, narrow **Governance Events to
+Send** or turn off the instrumentation you do not need.
+
+### If the API is unreachable, spans are lost silently
+
+**On API Error** defaults to *Fail Open*: the workflow continues ungoverned and
+the spans for that run are simply never recorded, with no failure surfaced in
+the workflow. Choose *Fail Closed* if a missing audit trail should stop the run.
+
+### Approval can only gate work that has not happened yet
+
+Database queries are held until the verdict arrives, so `block` or
+`require_approval` can prevent one. A verdict on a *completed* span cannot
+un-run the work — it is recorded, not enforced. With HITL enabled the node
+blocks while polling, up to **Approval Max Wait** (default 3600 s; `0` waits
+indefinitely).
+
+### Cost, token counts and LLM classification come from the API, not this node
+
+The node sends the request and response; the OpenBox API decides the span type
+and extracts model and usage. If your deployment does not recognise a provider's
+domain, that provider's calls are classified as plain HTTP and cost and token
+totals stay at zero. This is a server-side gap, not something the node can fix —
+`openrouter.ai` is a known case on older deployments.
+
+### Filter caveats
+
+- **Postgres** relies on a call-stack frame. If an async boundary ever drops it,
+  one of n8n's own queries can surface as a span. Visible, harmless, reportable.
+- **Redis** filtering is verified against a real `ioredis` client and a real
+  Bull queue, but has not been observed firing during a live queued execution:
+  in local queue-mode testing, n8n's queue traffic never entered a governed
+  activity's context, so the filter was never reached. It may behave differently
+  on deployments where n8n uses Redis for caching or locking during node
+  initialisation.
+- **MySQL and MongoDB have no equivalent origin filter.** n8n does not use them
+  internally, so there is nothing to exclude — but if n8n or another community
+  node did, those queries would appear as agent spans.
+
+### Chat memory issues repeated DDL
+
+n8n's Postgres chat memory runs `CREATE TABLE IF NOT EXISTS` on every load, so
+you will see that span on each `load_memory`. It is the memory node's behaviour,
+not a duplicate span.
+
+### Testing locally
+
+`n8n execute` on the CLI **does not support queue mode** and silently falls back
+to regular mode, so it cannot reproduce anything specific to a queue-mode
+deployment. To exercise a worker, run n8n in queue mode and trigger the workflow
+so the main instance enqueues it — a schedule trigger is the simplest way.
+
+### Node identity is tied to the node's name
+
+The agent name is derived as `n8n.Agent.<Node_Name>`. Renaming the node in the
+canvas starts reporting under a new agent name, which splits your history.
 
 ## Package layout
 

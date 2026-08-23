@@ -417,26 +417,49 @@ function patchPg(): boolean {
 }
 
 /**
- * Returns true when the given pg connection parameters identify n8n's own
- * internal database (workflows, credentials, executions). Queries on that
- * connection are n8n bookkeeping — capturing them as governance spans would
- * add noise for every tool invocation that causes n8n to refresh credentials.
+ * Frames belonging to n8n's own persistence layer.
  *
- * Detection: both host AND database must match the DB_POSTGRESDB_* env vars
- * (defaults: host=postgres, database=n8n). Using AND avoids false positives
- * when the user's application database lives on the same host but has a
- * different name, or vice-versa.
+ * n8n routes every internal database access through its TypeORM fork, and the
+ * agent's work never goes through it — a traced run separates 17/17 correctly
+ * on this signal: n8n's credential lookups and TypeORM's own `SET search_path`
+ * / `SET statement_timeout` on one side, the agent's chat-memory queries on the
+ * other.
+ *
+ * Deliberately matches the `@n8n/typeorm` fork rather than any TypeORM: a tool
+ * querying its own database through vanilla TypeORM is the agent's work and
+ * must still be traced.
  */
-function isN8nInternalPgConnection(
-  host: string | null | undefined,
-  dbName: string | null | undefined,
-): boolean {
-  const n8nHost = (_env.DB_POSTGRESDB_HOST || 'postgres').toLowerCase();
-  const n8nDb = (_env.DB_POSTGRESDB_DATABASE || 'n8n').toLowerCase();
-  return (
-    Boolean(host)   && host!.toLowerCase()   === n8nHost &&
-    Boolean(dbName) && dbName!.toLowerCase() === n8nDb
-  );
+const N8N_ORM_FRAME = /[\\/]@n8n[\\/]typeorm[\\/]/;
+
+/** True when this stack shows the query came from n8n's own ORM. */
+export function isN8nOrmStack(stack: string): boolean {
+  return N8N_ORM_FRAME.test(stack);
+}
+
+/**
+ * True when the caller is n8n's own persistence layer rather than the agent.
+ *
+ * Replaces an earlier check that compared the *connection* against the
+ * DB_POSTGRESDB_* env vars. That could not work when the agent and n8n share a
+ * database — n8n's own compose setup points a Postgres chat memory at exactly
+ * that database — and it silently dropped every memory span: a run whose agent
+ * issued 5 memory queries reported none of them. Call origin is independent of
+ * host, database and table naming, so it holds however the deployment is wired.
+ *
+ * Costs one stack capture per query, and only inside a governed activity: the
+ * caller checks `getCurrentActivityId()` before reaching here.
+ *
+ * If an async boundary ever drops the ORM frame, an n8n query surfaces as one
+ * stray span — visible and fixable. It cannot silently swallow agent data,
+ * which is the failure the connection check produced.
+ */
+function isN8nOrmQuery(): boolean {
+  const previousLimit = Error.stackTraceLimit;
+  // The ORM frame sits a few frames up, past pg's own internals.
+  Error.stackTraceLimit = 40;
+  const stack = new Error().stack ?? '';
+  Error.stackTraceLimit = previousLimit;
+  return isN8nOrmStack(stack);
 }
 
 function patchPgExports(pg: Record<string, unknown>): boolean {
@@ -478,9 +501,9 @@ function patchPgExports(pg: Record<string, unknown>): boolean {
         const port = self.port ?? self.options?.port ?? self.connectionParameters?.port;
         const dbName = self.database ?? self.options?.database ?? self.connectionParameters?.database;
 
-        // Skip n8n's own internal postgres (credentials/workflows DB) to avoid
-        // spurious spans from n8n loading credentials during tool execution.
-        if (isN8nInternalPgConnection(host, dbName)) return original.call(self, query, ...args);
+        // n8n's own bookkeeping (credential lookups during node init) is not
+        // the agent's work; the agent's queries on the same database are.
+        if (isN8nOrmQuery()) return original.call(self, query, ...args);
 
         const dbOpts = {
           dbSystem: 'postgresql' as const,
@@ -754,7 +777,7 @@ export function redisConnectionInfo(client: unknown): {
  * whose only memory was Postgres came back with five of seven spans being
  * redis — none of them the agent's work.
  *
- * Matches host AND port, mirroring isN8nInternalPgConnection's AND semantics so
+ * Matches host AND port, mirroring the pg filter's AND semantics so
  * a different Redis on the same host is still traced.
  */
 export function isN8nQueueRedisConnection(
