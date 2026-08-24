@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-openbox-hook",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "OpenBox governance community node for n8n",
   "license": "MIT",
   "author": {

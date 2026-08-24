@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.buildDbSpanData = buildDbSpanData;
 exports.isN8nOrmStack = isN8nOrmStack;
+exports.patchConnectMethod = patchConnectMethod;
 exports.redisConnectionInfo = redisConnectionInfo;
 exports.isN8nQueueRedisConnection = isN8nQueueRedisConnection;
 exports.isN8nInternalRedisCommand = isN8nInternalRedisCommand;
@@ -393,6 +394,92 @@ function isN8nOrmQuery() {
     Error.stackTraceLimit = previousLimit;
     return isN8nOrmStack(stack);
 }
+/**
+ * Report a *failed* connection attempt as a span pair.
+ *
+ * Only failures are reported. Connection establishment was previously not
+ * instrumented at all, so a server the agent could not reach produced no span:
+ * a hosted trace showed `load_memory` and `save_context` recording `failed`
+ * after ~1.4s against a broken Supabase credential with nothing to explain it.
+ *
+ * Instrumenting every attempt fixed that but flooded the trace — a healthy run
+ * emitted 14 successful CONNECT spans against 14 spans of real work, doubling
+ * both the span count and the run time, since each span is its own governance
+ * round-trip. A successful connection carries no information the queries on it
+ * do not already carry, so only the failure is worth a span.
+ *
+ * Deliberately fire-and-forget: connections open while n8n initialises a
+ * sub-node, and every governance request itself loads a credential — awaiting
+ * there produced a governance/credential/query recursion once already.
+ */
+function reportFailedConnect(dbSystem, conn, startMs, error) {
+    const activityId = (0, span_processor_1.getCurrentActivityId)();
+    if (!activityId)
+        return;
+    const dbOpts = {
+        dbSystem,
+        dbName: conn.dbName ?? null,
+        operation: 'CONNECT',
+        // Target only — never the credential that authenticates it.
+        statement: `CONNECT ${conn.host ?? 'unknown'}${conn.port != null ? `:${conn.port}` : ''}${conn.dbName ? `/${conn.dbName}` : ''}`,
+        host: conn.host ?? null,
+        port: conn.port ?? null,
+    };
+    // Sends are ordered per activity, so started lands before completed.
+    void evaluateDb(activityId, { ...dbOpts, stage: 'started', startMs })
+        .catch(() => { });
+    void evaluateDb(activityId, {
+        ...dbOpts, stage: 'completed', startMs, endMs: Date.now(), error,
+    }).catch(() => { });
+}
+/**
+ * Wrap a driver's `connect` so the attempt is traced whichever calling
+ * convention it uses — callback, promise, or synchronous.
+ */
+function patchConnectMethod(proto, method, dbSystem, readConn, skip) {
+    const original = proto[method];
+    if (typeof original !== 'function' || proto[`_openbox${method}Patched`])
+        return;
+    proto[`_openbox${method}Patched`] = true;
+    proto[method] = function patchedConnect(...args) {
+        const call = () => original.apply(this, args);
+        if (!(0, span_processor_1.getCurrentActivityId)())
+            return call();
+        let conn;
+        try {
+            conn = readConn(this);
+        }
+        catch {
+            conn = {};
+        }
+        // n8n's own pools connect through its ORM; those are not the agent's work.
+        if (isN8nOrmQuery() || (skip?.(conn) ?? false))
+            return call();
+        const startMs = Date.now();
+        const fail = (err) => reportFailedConnect(dbSystem, conn, startMs, err);
+        const lastArg = args[args.length - 1];
+        if (typeof lastArg === 'function') {
+            const callerCb = lastArg;
+            args[args.length - 1] = function patchedConnectCallback(err, ...rest) {
+                if (err)
+                    fail(err);
+                return callerCb.call(this, err, ...rest);
+            };
+            return call();
+        }
+        try {
+            const result = call();
+            if (result && typeof result.then === 'function') {
+                return result.then((value) => value, (err) => { fail(err); throw err; });
+            }
+            return result;
+        }
+        catch (err) {
+            fail(err);
+            throw err;
+        }
+    };
+}
 function patchPgExports(pg) {
     try {
         const pgAny = pg;
@@ -404,6 +491,21 @@ function patchPgExports(pg) {
         // Core, where the first span's governance round-trip takes ~1s — long
         // enough for the dedupe entry to expire before the delegated call fires.
         // Patching the client alone captures pooled and direct queries exactly once.
+        const readPgConn = (self) => {
+            const c = self;
+            return {
+                host: c.host ?? c.options?.host ?? c.connectionParameters?.host ?? null,
+                port: c.port ?? c.options?.port ?? c.connectionParameters?.port ?? null,
+                dbName: c.database ?? c.options?.database ?? c.connectionParameters?.database ?? null,
+            };
+        };
+        // Both, because the chat memory goes through Pool.connect() while a direct
+        // client goes through Client.connect(); an unreachable server must be
+        // reported either way.
+        for (const ctor of [pgAny.Client, pgAny.Pool]) {
+            if (ctor?.prototype)
+                patchConnectMethod(ctor.prototype, 'connect', 'postgresql', readPgConn);
+        }
         const prototypes = [pgAny.Client?.prototype]
             .filter((proto) => Boolean(proto));
         for (const proto of prototypes) {
@@ -506,6 +608,12 @@ function patchMysql2Exports(mysql2) {
     try {
         const mysqlAny = mysql2;
         const proto = mysqlAny.Connection?.prototype;
+        if (proto) {
+            patchConnectMethod(proto, 'connect', 'mysql', (self) => {
+                const c = self.config ?? {};
+                return { host: c.host ?? null, port: c.port ?? null, dbName: c.database ?? null };
+            });
+        }
         if (!proto || proto._openboxQueryPatched || typeof proto.query !== 'function')
             return false;
         const original = proto.query;
@@ -596,6 +704,13 @@ function patchMongo() {
 }
 function patchMongoExports(mongodb) {
     const mongoAny = mongodb;
+    if (mongoAny.MongoClient?.prototype) {
+        patchConnectMethod(mongoAny.MongoClient.prototype, 'connect', 'mongodb', (self) => {
+            const c = self;
+            const first = c.options?.hosts?.[0];
+            return { host: first?.host ?? null, port: first?.port ?? null, dbName: c.options?.dbName ?? null };
+        });
+    }
     const proto = mongoAny.Collection?.prototype;
     if (!proto || proto._openboxQueryPatched)
         return Boolean(proto);
@@ -728,6 +843,7 @@ function patchRedisExports(redis) {
     redis._openboxCreateClientPatched = true;
     redis.createClient = function patchedCreateClient(...args) {
         const client = Reflect.apply(originalCreateClient, this, args);
+        patchRedisConnect(client);
         patchRedisClient(client);
         return client;
     };
@@ -747,7 +863,20 @@ function patchIoRedisExports(redisCtor) {
     const proto = redisCtor.prototype;
     if (!proto)
         return false;
+    patchRedisConnect(proto);
     return patchRedisClient(proto);
+}
+/**
+ * Trace connection attempts for a redis client or prototype.
+ *
+ * Uses the same queue-connection guard as the command patch, so n8n's own Bull
+ * and pub/sub clients are not reported as the agent's work.
+ */
+function patchRedisConnect(target) {
+    patchConnectMethod(target, 'connect', 'redis', (self) => {
+        const c = redisConnectionInfo(self);
+        return { host: c.host, port: c.port, dbName: c.db };
+    }, (conn) => isN8nQueueRedisConnection(conn.host, conn.port));
 }
 function patchRedisClient(client) {
     if (client._openboxSendCommandPatched || typeof client.sendCommand !== 'function')

@@ -111,6 +111,22 @@ n8n's own persistence between executions — is not captured, by design.
 | MongoDB | `FIND mongodb`, `INSERTONE mongodb`, … | On by default. Named by collection method. |
 | Redis | `GET redis`, `HGETALL redis`, … | On by default. Excludes n8n's queue traffic — see below. |
 | File I/O | `file.read`, `file.write`, … | **Off** by default. |
+| Failed connections | `CONNECT postgresql`, `CONNECT redis`, … | Emitted **only when a connection fails** — see below. |
+
+#### Failed connections
+
+A database that cannot be reached produces no queries, so without this there is
+nothing in the trace to explain the failure — the activity simply completes
+having done nothing, and a wrong host or an expired password looks identical to
+an idle one. A failed connection is therefore reported as a `CONNECT` span
+carrying the driver's own error (`getaddrinfo ENOTFOUND …`, `password
+authentication failed`, a timeout) and the target host, port and database. The
+credential itself is never included.
+
+Successful connections are deliberately **not** reported. They carry nothing the
+queries on that connection do not already carry, and since every span is its own
+round trip to the OpenBox API, reporting them doubled both the span count and
+the runtime of a healthy run.
 
 #### Telling your work apart from n8n's
 
