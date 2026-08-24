@@ -587,11 +587,14 @@ function patchPgExports(pg: Record<string, unknown>): boolean {
         dbName: c.database ?? c.options?.database ?? c.connectionParameters?.database ?? null,
       };
     };
-    // Both, because the chat memory goes through Pool.connect() while a direct
-    // client goes through Client.connect(); an unreachable server must be
-    // reported either way.
-    for (const ctor of [pgAny.Client, pgAny.Pool]) {
-      if (ctor?.prototype) patchConnectMethod(ctor.prototype, 'connect', 'postgresql', readPgConn);
+    // ONLY Client.prototype, for the same reason the query patch below gives:
+    // Pool.connect() acquires a client and delegates to Client.connect(), so
+    // patching both reports one connection attempt TWICE. A pooled memory read
+    // showed two CONNECT failures per activity when n8n had made one attempt.
+    // Patching the client alone covers pooled and direct connections exactly
+    // once.
+    if (pgAny.Client?.prototype) {
+      patchConnectMethod(pgAny.Client.prototype, 'connect', 'postgresql', readPgConn);
     }
 
     const prototypes = [pgAny.Client?.prototype]
