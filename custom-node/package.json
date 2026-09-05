@@ -47,9 +47,9 @@
     "n8n-workflow": "*"
   },
   "devDependencies": {
-    "@n8n/node-cli": "^0.34.0",
+    "@n8n/node-cli": "^0.46.4",
     "@types/node": "^20.19.41",
-    "n8n-workflow": "2.31.1",
+    "n8n-workflow": "2.38.1",
     "typescript": "^5.9.3",
     "vitest": "^4.1.2"
   },
